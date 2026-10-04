@@ -5,6 +5,15 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+st.set_page_config(
+    page_title="晨間量化交易", 
+    page_icon="📈", 
+    layout="wide", # 讓畫面自動向左右延展
+    initial_sidebar_state="collapsed" # 在手機上預設收合側邊欄，節省空間
+)
+
+
+
 st.set_page_config(layout="wide")
 
 # ==========================================
