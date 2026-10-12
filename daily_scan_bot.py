@@ -19,7 +19,7 @@ TARGET_STOCKS = ["2327.TW", "2330.TW", "2454.TW"]
 
 💡 進階技巧：未來部署到 GitHub Actions 時，建議改用 os.getenv("TEAMS_WEBHOOK_URL") 讀取 Secret
 
-WEBHOOK_URL = "請把你的_TEAMS_WEBHOOK_URL_貼在這裡"
+WEBHOOK_URL = "https://default54eb9440cf0345fe835e61bd4ce515.c8.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/14/workflows/4f478f5755a2464f9cd9e6484979f296/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=zMCuosswuPQ1CRTAaB1XMyCT6aRcBgAQyIxL7EDTP-Q"
 
 設定台北時區 (GitHub 伺服器預設為 UTC 英國時間，必須強制轉換為台北時間)
 
