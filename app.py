@@ -1,20 +1,13 @@
 import yfinance as yf
 import streamlit as st
+import requests
+import json
 import datetime
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-st.set_page_config(
-    page_title="晨間量化交易", 
-    page_icon="📈", 
-    layout="wide", # 讓畫面自動向左右延展
-    initial_sidebar_state="collapsed" # 在手機上預設收合側邊欄，節省空間
-)
-
-
-
-st.set_page_config(layout="wide")
+st.set_page_config(page_title="晨間量化交易", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
 # === 0. 夜間模式開關與全局樣式設定 ===
@@ -47,20 +40,88 @@ st.title("我的個人專屬看盤 App 📈")
 
 STOCK_NAMES = {
     "2327.TW": "國巨",
-    "3260.TW": "威剛",
     "2330.TW": "台積電",
     "2454.TW": "聯發科",
-    "2317.TW": "鴻海",
-    "2382.TW": "廣達"
 }
 
 def format_ticker(ticker):
     name = STOCK_NAMES.get(ticker, "")
     return f"{ticker} ({name})" if name else ticker
 
+# ==========================================
+# 📲 Teams 推播通訊模組
+# ==========================================
+def send_teams_alert(ticker, current_price, advice):
+    # 🔴 請記得將下方替換成你專屬的 Teams Webhook URL
+    webhook_url = "請把你的_TEAMS_WEBHOOK_URL_貼在這裡"
+    
+    payload = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": "28A745",
+        "summary": f"🔔 {ticker} 即時盤中訊號",
+        "sections": [{
+            "activityTitle": f"📈 **量化系統警報：{ticker}**",
+            "activitySubtitle": "⏱️ 9:20 開盤區間突破 (ORB) 策略觸發",
+            "facts": [
+                {"name": "觸發市價", "value": f"{current_price} 元"},
+                {"name": "系統建議", "value": advice}
+            ],
+            "markdown": True
+        }]
+    }
+    headers = {'Content-Type': 'application/json'}
+    try:
+        requests.post(webhook_url, headers=headers, data=json.dumps(payload))
+    except:
+        pass
+
+# ==========================================
+# 💰 真實法人籌碼抓取模組 (FinMind API)
+# ==========================================
+@st.cache_data(ttl=3600)  # 設定快取1小時，網頁切換時不用重新抓，保護 API 額度
+def fetch_institutional_chips(ticker):
+    # FinMind 股票代號不需要 .TW，所以要把 2330.TW 變成 2330
+    stock_id = ticker.split('.')[0] 
+    
+    start_date = (datetime.date.today() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    parameter = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "data_id": stock_id,
+        "start_date": start_date
+    }
+    
+    try:
+        response = requests.get(url, params=parameter)
+        data = response.json()
+        
+        if data.get("msg") == "success" and len(data.get("data", [])) > 0:
+            df = pd.DataFrame(data["data"])
+            name_mapping = {
+                'Foreign_Investor': '外資',
+                'Investment_Trust': '投信',
+            }
+            df['name'] = df['name'].map(name_mapping)
+            df_filtered = df[df['name'].isin(['外資', '投信'])].copy()
+            
+            if not df_filtered.empty:
+                df_filtered['買進(張)'] = df_filtered['buy'] // 1000
+                df_filtered['賣出(張)'] = df_filtered['sell'] // 1000
+                df_filtered['買賣超(張)'] = df_filtered['買進(張)'] - df_filtered['賣出(張)']
+                
+                df_filtered = df_filtered.rename(columns={'date': '日期', 'name': '法人'})
+                # 依照日期排序，最新的在最上面
+                final_df = df_filtered[['日期', '法人', '買進(張)', '賣出(張)', '買賣超(張)']].sort_values(by='日期', ascending=False)
+                return final_df
+    except Exception as e:
+        pass
+    
+    return None # 如果失敗或沒資料回傳空值
+
 if 'watchlists' not in st.session_state:
     st.session_state['watchlists'] = {
-        "我的觀察清單 1": ["2327.TW", "3260.TW", "2330.TW", "2454.TW"],
+        "我的觀察清單 1": ["2327.TW", "2330.TW", "2454.TW"],
         "電子股": ["2317.TW", "2382.TW"]
     }
 
@@ -71,7 +132,7 @@ st.sidebar.markdown("<h3 style='color: #4A90E2;'>⚙️ 控制面板</h3>", unsa
 
 selected_ticker = None
 
-with st.sidebar.expander("🌸 自選股票 (點此展開選股)", expanded=False):
+with st.sidebar.expander("🌸 自選股票與日期區間", expanded=True):
     list_names = list(st.session_state['watchlists'].keys())
     current_list = st.selectbox("📂 選擇群組", list_names)
     current_stocks = st.session_state['watchlists'][current_list]
@@ -82,7 +143,15 @@ with st.sidebar.expander("🌸 自選股票 (點此展開選股)", expanded=Fals
         st.info("這個群組目前是空的喔！")
         
     st.markdown("---")
-    manage_mode = st.checkbox("🔧 展開管理面板 (新增 / 移除 / 重新命名)")
+    
+    st.markdown("🗓️ **圖表日期區間設定**")
+    default_end_date = datetime.date.today()
+    default_start_date = default_end_date - datetime.timedelta(days=180)
+    start_date = st.date_input("開始日期", default_start_date)
+    end_date = st.date_input("結束日期", default_end_date)
+    
+    st.markdown("---")
+    manage_mode = st.checkbox("🔧 展開管理面板 (新增/移除股票)")
     
     if manage_mode:
         st.markdown(f"**管理：<span style='color: #4A90E2;'>{current_list}</span>**", unsafe_allow_html=True)
@@ -116,11 +185,11 @@ with st.sidebar.expander("🌸 自選股票 (點此展開選股)", expanded=Fals
                 st.success(f"已成功建立：{new_list_name}")
                 st.rerun()
 
-with st.sidebar.expander("🤖 AI 投資建議 (晨間盤前決策)", expanded=False):
+with st.sidebar.expander("🤖 AI 投資建議", expanded=False):
     st.markdown("<b style='color: #4A90E2;'>連動美股前夜收盤與國際局勢分析</b>", unsafe_allow_html=True)
     ai_group = st.selectbox("🎯 選擇盤前分析群組", list(st.session_state['watchlists'].keys()), key="ai_group")
     ai_stocks = st.session_state['watchlists'][ai_group]
-    run_ai_advice = st.button("🌅 產出今日晨間 AI 決策報告")
+    run_ai_advice = st.button("🌅 產出今日 AI 投資建議報告")
 
 with st.sidebar.expander("💡 推薦進場點 (多週期與技術面掃描)", expanded=False):
     st.markdown("<b style='color: #E24A4A;'>自動解析支撐壓力與動能訊號</b>", unsafe_allow_html=True)
@@ -128,22 +197,141 @@ with st.sidebar.expander("💡 推薦進場點 (多週期與技術面掃描)", e
     scan_stocks = st.session_state['watchlists'][scan_group]
     run_scan = st.button("🔍 執行深度掃描與回測")
 
-with st.sidebar.expander("📅 日期區間設定 (點此展開)", expanded=False):
-    default_end_date = datetime.date.today()
-    default_start_date = default_end_date - datetime.timedelta(days=180)
-    start_date = st.date_input("開始日期", default_start_date)
-    end_date = st.date_input("結束日期", default_end_date)
+
+# ==========================================
+# 🎨 獨立畫圖函式 
+# ==========================================
+def render_stock_chart(ticker_symbol):
+    title_color = "#FF6B6B" if dark_mode else "#E24A4A"
+    st.markdown(f"<h5>目前查看： <span style='color: {title_color};'>{format_ticker(ticker_symbol)}</span></h5>", unsafe_allow_html=True)
+
+    try:
+        if start_date > end_date:
+            st.error("錯誤：開始日期不能晚於結束日期！")
+            return
+        
+        stock = yf.Ticker(ticker_symbol)
+        df_chart = stock.history(start=start_date, end=end_date)
+
+        if not df_chart.empty:
+            df_chart.index = pd.to_datetime(df_chart.index).tz_localize(None)
+            
+            df_chart['5MA'] = df_chart['Close'].rolling(5).mean()
+            df_chart['20MA'] = df_chart['Close'].rolling(20).mean()
+            
+            ema12 = df_chart['Close'].ewm(span=12, adjust=False).mean()
+            ema26 = df_chart['Close'].ewm(span=26, adjust=False).mean()
+            df_chart['MACD'] = ema12 - ema26
+            df_chart['Signal'] = df_chart['MACD'].ewm(span=9, adjust=False).mean()
+            df_chart['Histogram'] = df_chart['MACD'] - df_chart['Signal']
+            
+            macd_colors = [up_color if val >= 0 else down_color for val in df_chart['Histogram']]
+            vol_colors = [up_color if close >= open else down_color for close, open in zip(df_chart['Close'], df_chart['Open'])]
+
+            fig = make_subplots(
+                rows=3, cols=1, 
+                shared_xaxes=True,             
+                vertical_spacing=0.03,         
+                row_heights=[0.6, 0.15, 0.25] 
+            )
+
+            fig.add_trace(go.Candlestick(
+                x=df_chart.index, open=df_chart['Open'], high=df_chart['High'], low=df_chart['Low'], close=df_chart['Close'],
+                name='K線',
+                increasing_line_color=up_color, decreasing_line_color=down_color,
+                hovertemplate="<b>日期: %{x}</b><br>開盤: %{open:.2f}<br>最高: %{high:.2f}<br>最低: %{low:.2f}<br>收盤: %{close:.2f}<extra></extra>"
+            ), row=1, col=1)
+            
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['5MA'], line=dict(color='orange', width=1.5), name='5日均線', hovertemplate="5日均線: %{y:.2f}<extra></extra>"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['20MA'], line=dict(color='dodgerblue', width=1.5), name='20日均線', hovertemplate="20日均線: %{y:.2f}<extra></extra>"), row=1, col=1)
+
+            fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Volume'], marker_color=vol_colors, name='成交量', hovertemplate="成交量: %{y:,}<extra></extra>"), row=2, col=1)
+
+            fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Histogram'], marker_color=macd_colors, name='MACD柱狀圖', hovertemplate="MACD柱: %{y:.2f}<extra></extra>"), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MACD'], line=dict(color='fuchsia', width=1.5), name='MACD線', hovertemplate="MACD線: %{y:.2f}<extra></extra>"), row=3, col=1)
+            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['Signal'], line=dict(color='cyan', width=1.5), name='訊號線', hovertemplate="訊號線: %{y:.2f}<extra></extra>"), row=3, col=1)
+
+            fig.update_yaxes(title_text="股價", row=1, col=1)
+            fig.update_yaxes(title_text="成交量", row=2, col=1)
+            fig.update_yaxes(title_text="指標", row=3, col=1)
+
+            fig.update_layout(
+                title=f"專業動態技術分析圖",
+                height=750,
+                margin=dict(l=20, r=20, t=40, b=20),
+                xaxis_rangeslider_visible=False, 
+                hovermode="x unified",            
+                plot_bgcolor=chart_bg,            
+                paper_bgcolor=chart_bg,
+                font=dict(color=font_color)
+            )
+            
+            fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+            fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor=grid_color)
+            fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor=grid_color)
+
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 👇籌碼顯示區塊👇
+            st.markdown("---")
+            st.subheader(f"💰 {ticker_symbol} 真實法人籌碼 (近15日外資/投信動向)")
+            
+            chip_df = fetch_institutional_chips(ticker_symbol)
+            
+            if chip_df is not None and not chip_df.empty:
+                recent_foreign = chip_df[chip_df['法人'] == '外資']['買賣超(張)'].sum()
+                recent_trust = chip_df[chip_df['法人'] == '投信']['買賣超(張)'].sum()
+                
+                col1, col2 = st.columns(2)
+                col1.metric("近期外資總動向", f"{recent_foreign:,} 張")
+                col2.metric("近期投信總動向", f"{recent_trust:,} 張")
+                
+                st.dataframe(
+                    chip_df, 
+                    width="stretch", 
+                    hide_index=True,
+                    column_config={
+                        "買賣超(張)": st.column_config.NumberColumn(
+                            "買賣超(張)",
+                            help="正數為買超，負數為賣超"
+                        )
+                    }
+                )
+            else:
+                st.warning("目前無法取得最新的法人籌碼資料。可能是因為今日非交易日，或 API 暫時無回應。")
+            # 👆籌碼區塊結束👆
+            
+            st.subheader("📝 原始數據 (最後 5 筆)")
+            
+            display_df = df_chart[['Open', 'High', 'Low', 'Close', 'Volume', 'MACD']].copy()
+            display_df.columns = ['開盤價', '最高價', '最低價', '收盤價', '成交量', 'MACD']
+            display_df.index = display_df.index.strftime('%Y-%m-%d') 
+            display_df.index.name = '日期'
+
+            def color_rows(row):
+                color = up_color if row['收盤價'] >= row['開盤價'] else down_color
+                return [f'color: {color}; font-weight: bold;' for _ in row]
+
+            format_dict = {'開盤價': '{:.2f}', '最高價': '{:.2f}', '最低價': '{:.2f}', '收盤價': '{:.2f}', '成交量': '{:,.0f}', 'MACD': '{:.2f}'}
+            styled_df = display_df.tail().style.format(format_dict).apply(color_rows, axis=1)
+            
+            st.dataframe(styled_df, use_container_width=True)
+            
+        else:
+            st.error("這段期間找不到資料，可能是非交易日或代號錯誤。")
+    
+    except Exception as e:
+        st.error(f"畫圖發生錯誤: {e}")
 
 
 # ==========================================
 # === 2. 右側主畫面 (動態決策與圖表區) ===
 # ==========================================
 
-# ----------------- 晨間 AI 投資建議報告區 -----------------
 if run_ai_advice:
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    st.markdown(f"## 🤖 晨間 AI 盤前投資建議 (連動美股與國際局勢)")
-    st.caption(f"📅 報告產出時間：{now_str} (適用今日台股開盤決策) ｜ 標的群組：`{ai_group}`")
+    st.markdown(f"## 🤖 AI 投資建議 (連動美股與即時局勢)")
+    st.caption(f"📅 報告產出時間：{now_str} ｜ 標的群組：`{ai_group}`")
     
     with st.spinner("正在連線抓取美股收盤行情與隔夜國際新聞..."):
         us_indices = {
@@ -156,17 +344,17 @@ if run_ai_advice:
         sox_change = 0.0
         tsm_change = 0.0
         
-        for name, ticker in us_indices.items():
+        for name, us_ticker in us_indices.items():
             try:
-                us_hist = yf.Ticker(ticker).history(period="5d")
+                us_hist = yf.Ticker(us_ticker).history(period="5d")
                 if len(us_hist) >= 2:
                     last_close = us_hist['Close'].iloc[-1]
                     prev_close = us_hist['Close'].iloc[-2]
                     chg_pct = ((last_close - prev_close) / prev_close) * 100
                     us_results[name] = (last_close, chg_pct)
-                    if ticker == "^SOX":
+                    if us_ticker == "^SOX":
                         sox_change = chg_pct
-                    elif ticker == "TSM":
+                    elif us_ticker == "TSM":
                         tsm_change = chg_pct
                 else:
                     us_results[name] = (0.0, 0.0)
@@ -188,7 +376,7 @@ if run_ai_advice:
         us_desc = "美股主要科技指數因利率預期或總經數據修正出現較深回檔，科技權值股短線面臨外資提款賣壓，開盤需提防殺低取量震盪。"
     else:
         us_sentiment = "中性震盪"
-        us_desc = "美股主要指數窄幅震盪收小紅/小黑，市場處於數據真空期或觀望國際政經變化，台股今日開盤預期回歸個股籌碼與基本面題材表現。"
+        us_desc = "美股主要指數窄幅震盪收小紅/小黑，市場處於數據真空期或觀望國際政經變化，台股今日預期回歸個股籌碼與基本面題材表現。"
         
     st.info(f"**【隔夜市場氛圍】：{us_sentiment}**\n\n{us_desc}")
     st.markdown("---")
@@ -216,7 +404,7 @@ if run_ai_advice:
                         
                         if sox_change >= 1.0 and last_c > ma20:
                             today_verdict = "🟢 今日建議買進 (Buy Today)"
-                            verdict_summary = "長短線多頭確立，受美股半導體與 ADR 激勵，今日開盤順勢偏多操作。"
+                            verdict_summary = "長短線多頭確立，受美股半導體與 ADR 激勵，今日順勢偏多操作。"
                             in_low = round(last_c, 2)
                             in_high = round(last_c + (atr * 0.3), 2)
                             suggested_entry = f"{in_low} ~ {in_high} (開盤小幅回踩或試單)"
@@ -231,7 +419,7 @@ if run_ai_advice:
                             suggested_entry = f"{in_low} ~ {in_high} (逢低掛單低接)"
                             suggested_target = round(last_c + (atr * 1.0), 2)
                             suggested_stop = round(ma20 * 0.98, 2)
-                            allocation_today = "建議控制在 10%~15% 小量試單，切忌開盤急躁搶進。"
+                            allocation_today = "建議控制在 10%~15% 小量試單，切忌急躁搶進。"
                         elif last_c < ma20 and sox_change <= 0:
                             today_verdict = "⚪ 今日建議觀望 (Hold / Wait)"
                             verdict_summary = "個股短線失守月線均線，且外圍市場缺乏激勵因子，今日無明顯勝率優勢，建議空手觀望。"
@@ -241,7 +429,7 @@ if run_ai_advice:
                             allocation_today = "維持 0% 現金水位，等待趨勢扭轉。"
                         else:
                             today_verdict = "🔴 逢高減碼獲利 (Take Profit)"
-                            verdict_summary = "個股進入反彈壓力區或短線動能趨緩，趁美股平盤震盪時，逢高調節持股保護利潤。"
+                            verdict_summary = "個股進入反彈壓力區或短線動能趨緩，趁大盤震盪時，逢高調節持股保護利潤。"
                             suggested_entry = "不建議買入"
                             suggested_target = round(last_c + (atr * 0.8), 2)
                             suggested_stop = round(ma20, 2)
@@ -258,15 +446,60 @@ if run_ai_advice:
                         st.markdown(f"- **前日收盤市價**：`{last_c:.2f}` (昨日振幅 ATR: `{atr:.2f}` 元)")
                         st.markdown(f"- **今日部位配置建議**：{allocation_today}")
                         st.markdown(f"- **產業傳導分析**：該標的所屬族群與海外市場具備連動，前夜美股費半變動率 (`{sox_change:+.2f}%`) 對早盤情緒影響顯著。")
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        
+                        st.markdown("#### ⏱️ 9:20 早盤即時多空決策")
+                        try:
+                            intraday_df = s_obj.history(period="1d", interval="5m")
+                            if not intraday_df.empty and len(intraday_df) >= 4:
+                                morning_range = intraday_df.iloc[:4]
+                                orb_high = morning_range['High'].max()
+                                orb_low = morning_range['Low'].min()
+                                current_price = intraday_df['Close'].iloc[-1]
+                                
+                                if current_price > orb_high:
+                                    orb_status = "🟢 強勢突破早盤高點"
+                                    orb_advice = f"**可以考慮買進 (偏多操作)**。主力持續拉抬，股價已突破 9:20 前高點 **{orb_high:.2f}** 元。建議若盤中拉回不破此價位，即可作為進場買點。"
+                                elif current_price < orb_low:
+                                    orb_status = "🔴 弱勢跌破早盤低點"
+                                    orb_advice = f"**不建議買進 (偏空看待)**。早盤賣壓沉重，股價已跌穿 9:20 前低點 **{orb_low:.2f}** 元。上方套牢壓力大，請空手觀望或考慮反向做空，切勿輕易接刀。"
+                                else:
+                                    orb_status = "🟡 早盤區間震盪"
+                                    orb_advice = f"**建議先觀望 (方向未明)**。目前市價卡在 9:20 的高低點區間內 (**{orb_low:.2f} ~ {orb_high:.2f}**)。多空雙方仍在觀望，建議等待股價明確突破上緣或跌破下緣後，再跟隨趨勢進場。"
+                                
+                                st.markdown(f"- **目前盤中狀態**：`{orb_status}`")
+                                st.markdown(f"- **9:20 關鍵防守區**：高點壓力 `{orb_high:.2f}` / 低點支撐 `{orb_low:.2f}`")
+                                st.markdown(f"- **即時買賣建議**：{orb_advice}")
+                                
+                                # 👇 自動推播機制 👇
+                                if 'sent_alerts' not in st.session_state:
+                                    st.session_state['sent_alerts'] = {}
+                                    
+                                today_date = datetime.date.today().strftime("%Y-%m-%d")
+                                alert_key = f"{ticker}_{today_date}"
+                                
+                                if (current_price > orb_high or current_price < orb_low):
+                                    if st.session_state['sent_alerts'].get(alert_key) != True:
+                                        send_teams_alert(ticker, current_price, orb_advice)
+                                        st.session_state['sent_alerts'][alert_key] = True
+                                        st.toast(f"🤖 偵測到關鍵突破！已自動將 {ticker} 訊號推播至 Teams！")
+                                # 👆 自動推播機制結束 👆
+                                
+                            else:
+                                st.info("尚未取得今日 9:20 後的完整交易數據（若是盤前或假日，將暫不顯示即時判定）。")
+                        except Exception as e:
+                            st.error("無法載入盤中 5 分 K 線資料進行 9:20 分析。")
+                        
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        
+                        render_stock_chart(ticker)
                         
                 except Exception as e:
                     st.error(f"無法計算 {ticker} 之晨間建議：{e}")
-                    
+                
     st.markdown("<br><br>", unsafe_allow_html=True)
 
-
-# ----------------- 深度掃描報告區 -----------------
-if run_scan:
+elif run_scan:
     st.markdown(f"## 💡 深度掃描與回測報告：`{scan_group}`")
     
     if not scan_stocks:
@@ -363,15 +596,11 @@ if run_scan:
                         daily_trend = "向上" if close_d > ma20_d else "向下"
                         weekly_trend = "多頭" if df_weekly['Close'].iloc[-1] > ma20_w else "空頭"
                         
-                        # ==========================================
-                        # === 【新增】法人籌碼趨勢推估模型 ===
-                        # ==========================================
-                        # 分析近 5 日價量關係，模擬外資與投信的籌碼動向
                         last_5_days = df_daily.tail(5)
                         price_change_5d = ((last_5_days['Close'].iloc[-1] - last_5_days['Close'].iloc[0]) / last_5_days['Close'].iloc[0]) * 100
                         vol_5d_avg = last_5_days['Volume'].mean()
                         vol_20d_avg = df_daily['Volume'].tail(20).mean()
-                        vol_surge = vol_5d_avg > (vol_20d_avg * 1.2) # 近5日成交量是否大於月均量20%
+                        vol_surge = vol_5d_avg > (vol_20d_avg * 1.2)
                         
                         if price_change_5d > 3:
                             inst_trend = "📈 外資與投信同步偏多 (推估買超)"
@@ -391,7 +620,6 @@ if run_scan:
                                 inst_future = "底部量能放大但價格未明顯波動，可能有特定主力或法人正在換手吃貨，後續隨時準備方向表態。"
                             else:
                                 inst_future = "成交量萎縮，外資與投信資金暫時觀望，預期近期維持區間震盪整理。"
-                        # ==========================================
 
                         if rsi >= 70 and close_d >= resistance * 0.95:
                             signal_icon = "🔴"
@@ -451,114 +679,67 @@ if run_scan:
                             
                             st.markdown(f"> **💡 【優化進出場指引】**\n>\n> {bt_advice}")
 
-                            # === 【新增】：將推估的法人籌碼動向顯示在畫面上 ===
                             st.markdown("#### 🏦 法人籌碼趨勢與未來走向預估")
                             st.markdown(f"- **近五日籌碼狀態**：`{inst_trend}` (依據近期價量結構推估)")
                             st.markdown(f"- **未來走向研判**：{inst_future}")
-                            # ==========================================
                             
                             st.markdown("#### 📰 產業新聞與交易評估")
                             st.markdown(f"- **即時新聞**：`{news_display}`")
                             st.markdown(f"- **預期波動區間**：`{volatility_range}` (依近一季極值推算)")
                             st.markdown(f"- **部位配置建議**：{pos_advice}")
                             st.markdown("<br>", unsafe_allow_html=True)
+                            
+                            st.markdown("#### ⏱️ 9:20 早盤即時多空決策")
+                            try:
+                                intraday_df = stock_obj.history(period="1d", interval="5m")
+                                if not intraday_df.empty and len(intraday_df) >= 4:
+                                    morning_range = intraday_df.iloc[:4]
+                                    orb_high = morning_range['High'].max()
+                                    orb_low = morning_range['Low'].min()
+                                    current_price = intraday_df['Close'].iloc[-1]
+                                    
+                                    if current_price > orb_high:
+                                        orb_status = "🟢 強勢突破早盤高點"
+                                        orb_advice = f"**可以考慮買進 (偏多操作)**。主力持續拉抬，股價已突破 9:20 前高點 **{orb_high:.2f}** 元。建議若盤中拉回不破此價位，即可作為進場買點。"
+                                    elif current_price < orb_low:
+                                        orb_status = "🔴 弱勢跌破早盤低點"
+                                        orb_advice = f"**不建議買進 (偏空看待)**。早盤賣壓沉重，股價已跌穿 9:20 前低點 **{orb_low:.2f}** 元。請空手觀望或考慮反向做空，切勿輕易接刀。"
+                                    else:
+                                        orb_status = "🟡 早盤區間震盪"
+                                        orb_advice = f"**建議先觀望 (方向未明)**。目前市價卡在 9:20 的高低點區間內 (**{orb_low:.2f} ~ {orb_high:.2f}**)。建議等待股價明確突破上緣或跌破下緣後，再跟隨趨勢進場。"
+                                    
+                                    st.markdown(f"- **目前盤中狀態**：`{orb_status}`")
+                                    st.markdown(f"- **9:20 關鍵防守區**：高點壓力 `{orb_high:.2f}` / 低點支撐 `{orb_low:.2f}`")
+                                    st.markdown(f"- **即時買賣建議**：{orb_advice}")
+                                    
+                                    # 👇 自動推播機制 👇
+                                    if 'sent_alerts' not in st.session_state:
+                                        st.session_state['sent_alerts'] = {}
+                                        
+                                    today_date = datetime.date.today().strftime("%Y-%m-%d")
+                                    alert_key = f"{ticker}_{today_date}"
+                                    
+                                    if (current_price > orb_high or current_price < orb_low):
+                                        if st.session_state['sent_alerts'].get(alert_key) != True:
+                                            send_teams_alert(ticker, current_price, orb_advice)
+                                            st.session_state['sent_alerts'][alert_key] = True
+                                            st.toast(f"🤖 偵測到關鍵突破！已自動將 {ticker} 訊號推播至 Teams！")
+                                    # 👆 自動推播機制結束 👆
+                                else:
+                                    st.info("尚未取得今日 9:20 後的完整交易數據（若是盤前或假日，將暫不顯示即時判定）。")
+                            except Exception as e:
+                                st.error("無法載入盤中 5 分 K 線資料進行 9:20 分析。")
+                            
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                        render_stock_chart(ticker)
+
                 except Exception as e:
                     st.error(f"無法完整分析 {ticker}：{e}")
-                
+        
     st.markdown("<br><br>", unsafe_allow_html=True) 
 
-
-# ----------------- Plotly 動態圖表區 -----------------
-if selected_ticker:
-    title_color = "#FF6B6B" if dark_mode else "#E24A4A"
-    st.markdown(f"<h5>目前查看： <span style='color: {title_color};'>{format_ticker(selected_ticker)}</span></h5>", unsafe_allow_html=True)
-
-    try:
-        if start_date > end_date:
-            st.error("錯誤：開始日期不能晚於結束日期！")
-        else:
-            stock = yf.Ticker(selected_ticker)
-            df = stock.history(start=start_date, end=end_date)
-
-            if not df.empty:
-                df.index = pd.to_datetime(df.index).tz_localize(None)
-                
-                df['5MA'] = df['Close'].rolling(5).mean()
-                df['20MA'] = df['Close'].rolling(20).mean()
-                
-                ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-                ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-                df['MACD'] = ema12 - ema26
-                df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-                df['Histogram'] = df['MACD'] - df['Signal']
-                
-                macd_colors = [up_color if val >= 0 else down_color for val in df['Histogram']]
-                vol_colors = [up_color if close >= open else down_color for close, open in zip(df['Close'], df['Open'])]
-
-                fig = make_subplots(
-                    rows=3, cols=1, 
-                    shared_xaxes=True,           
-                    vertical_spacing=0.03,       
-                    row_heights=[0.6, 0.15, 0.25] 
-                )
-
-                fig.add_trace(go.Candlestick(
-                    x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-                    name='K線',
-                    increasing_line_color=up_color, decreasing_line_color=down_color,
-                    hovertemplate="<b>日期: %{x}</b><br>開盤: %{open:.2f}<br>最高: %{high:.2f}<br>最低: %{low:.2f}<br>收盤: %{close:.2f}<extra></extra>"
-                ), row=1, col=1)
-                
-                fig.add_trace(go.Scatter(x=df.index, y=df['5MA'], line=dict(color='orange', width=1.5), name='5日均線', hovertemplate="5日均線: %{y:.2f}<extra></extra>"), row=1, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['20MA'], line=dict(color='dodgerblue', width=1.5), name='20日均線', hovertemplate="20日均線: %{y:.2f}<extra></extra>"), row=1, col=1)
-
-                fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=vol_colors, name='成交量', hovertemplate="成交量: %{y:,}<extra></extra>"), row=2, col=1)
-
-                fig.add_trace(go.Bar(x=df.index, y=df['Histogram'], marker_color=macd_colors, name='MACD柱狀圖', hovertemplate="MACD柱: %{y:.2f}<extra></extra>"), row=3, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], line=dict(color='fuchsia', width=1.5), name='MACD線', hovertemplate="MACD線: %{y:.2f}<extra></extra>"), row=3, col=1)
-                fig.add_trace(go.Scatter(x=df.index, y=df['Signal'], line=dict(color='cyan', width=1.5), name='訊號線', hovertemplate="訊號線: %{y:.2f}<extra></extra>"), row=3, col=1)
-
-                fig.update_yaxes(title_text="股價", row=1, col=1)
-                fig.update_yaxes(title_text="成交量", row=2, col=1)
-                fig.update_yaxes(title_text="指標", row=3, col=1)
-
-                fig.update_layout(
-                    title=f"專業動態技術分析圖",
-                    height=750,
-                    margin=dict(l=20, r=20, t=40, b=20),
-                    xaxis_rangeslider_visible=False, 
-                    hovermode="x unified",           
-                    plot_bgcolor=chart_bg,            
-                    paper_bgcolor=chart_bg,
-                    font=dict(color=font_color)
-                )
-                
-                fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-                fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor=grid_color)
-                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor=grid_color)
-
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("📝 原始數據 (最後 5 筆)")
-                
-                display_df = df[['Open', 'High', 'Low', 'Close', 'Volume', 'MACD']].copy()
-                display_df.columns = ['開盤價', '最高價', '最低價', '收盤價', '成交量', 'MACD']
-                display_df.index = display_df.index.strftime('%Y-%m-%d') 
-                display_df.index.name = '日期'
-
-                def color_rows(row):
-                    color = up_color if row['收盤價'] >= row['開盤價'] else down_color
-                    return [f'color: {color}; font-weight: bold;' for _ in row]
-
-                format_dict = {'開盤價': '{:.2f}', '最高價': '{:.2f}', '最低價': '{:.2f}', '收盤價': '{:.2f}', '成交量': '{:,.0f}', 'MACD': '{:.2f}'}
-                styled_df = display_df.tail().style.format(format_dict).apply(color_rows, axis=1)
-                
-                st.dataframe(styled_df, use_container_width=True)
-                
-            else:
-                st.error("這段期間找不到資料，可能是非交易日或代號錯誤。")
-            
-    except Exception as e:
-        st.error(f"發生錯誤: {e}")
+elif selected_ticker:
+    render_stock_chart(selected_ticker)
 else:
-    st.info("👈 請從左側展開「🌸 自選股票」選單，選擇股票來查看圖表。")
+    st.info("👈 請從左側展開「🌸 自選股票與日期區間」選單，選擇股票來查看圖表。")
