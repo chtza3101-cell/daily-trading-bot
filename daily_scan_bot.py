@@ -1,143 +1,193 @@
 import yfinance as yf
 import pandas as pd
-import datetime
 import requests
 import json
+import datetime
+import os
 
-# ==========================================
-# === 1. 基本設定與 Webhook ===
-# ==========================================
-# 請將下面雙引號內的文字完整替換成你的 Teams 專屬 Webhook 網址
-TEAMS_WEBHOOK_URL = "https://default54eb9440cf0345fe835e61bd4ce515.c8.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/14/workflows/4f478f5755a2464f9cd9e6484979f296/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=zMCuosswuPQ1CRTAaB1XMyCT6aRcBgAQyIxL7EDTP-Q"
+==========================================
 
-# 觀察清單
-TARGET_STOCKS = ["2327.TW", "2330.TW", "2317.TW", "2454.TW"]
-STOCK_NAMES = {"2327.TW": "國巨", "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科"}
+⚙️ 基本設定與全域變數
 
-def format_ticker(ticker):
-    name = STOCK_NAMES.get(ticker, "")
-    return f"{ticker} ({name})" if name else ticker
+==========================================
 
-# ==========================================
-# === 2. 抓取美股數據 ===
-# ==========================================
-def get_us_market_context():
-    print("正在抓取美股收盤數據...")
-    sox_hist = yf.Ticker("^SOX").history(period="5d")
-    tsm_hist = yf.Ticker("TSM").history(period="5d")
+目標掃描清單
+
+TARGET_STOCKS = ["2327.TW", "2330.TW", "2454.TW"]
+
+🔴 請將這裡換成你的 Teams Webhook URL
+
+💡 進階技巧：未來部署到 GitHub Actions 時，建議改用 os.getenv("TEAMS_WEBHOOK_URL") 讀取 Secret
+
+WEBHOOK_URL = "請把你的_TEAMS_WEBHOOK_URL_貼在這裡"
+
+設定台北時區 (GitHub 伺服器預設為 UTC 英國時間，必須強制轉換為台北時間)
+
+TPE_TZ = datetime.timezone(datetime.timedelta(hours=8))
+TODAY_STR = datetime.datetime.now(TPE_TZ).strftime("%Y-%m-%d")
+
+記憶檔路徑，用來記錄今天推播過的股票，避免洗版
+
+LOG_FILE = "alert_history.json"
+
+==========================================
+
+💰 模組 1：真實法人籌碼抓取 (FinMind API)
+
+==========================================
+
+def fetch_institutional_chips(ticker):
+"""抓取近 15 日法人籌碼，並回傳格式化字串供 Teams 推播使用"""
+stock_id = ticker.split('.')[0]
+start_date = (datetime.datetime.now(TPE_TZ) - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+url = "https://api.finmindtrade.com/api/v4/data"
+parameter = {
+"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+"data_id": stock_id,
+"start_date": start_date
+}
+
+try:
+    response = requests.get(url, params=parameter)
+    data = response.json()
     
-    sox_change = 0.0
-    tsm_change = 0.0
-    
-    if len(sox_hist) >= 2:
-        sox_change = ((sox_hist['Close'].iloc[-1] - sox_hist['Close'].iloc[-2]) / sox_hist['Close'].iloc[-2]) * 100
-    if len(tsm_hist) >= 2:
-        tsm_change = ((tsm_hist['Close'].iloc[-1] - tsm_hist['Close'].iloc[-2]) / tsm_hist['Close'].iloc[-2]) * 100
+    if data.get("msg") == "success" and len(data.get("data", [])) > 0:
+        df = pd.DataFrame(data["data"])
+        name_mapping = {
+            'Foreign_Investor': '外資',
+            'Investment_Trust': '投信',
+        }
+        df['name'] = df['name'].map(name_mapping)
+        df_filtered = df[df['name'].isin(['外資', '投信'])].copy()
         
-    return sox_change, tsm_change
+        if not df_filtered.empty:
+            df_filtered['買賣超(張)'] = (df_filtered['buy'] - df_filtered['sell']) // 1000
+            
+            # 計算近期總和
+            recent_foreign = df_filtered[df_filtered['name'] == '外資']['買賣超(張)'].sum()
+            recent_trust = df_filtered[df_filtered['name'] == '投信']['買賣超(張)'].sum()
+            
+            return f"外資近15日動向: {recent_foreign:,} 張\n投信近15日動向: {recent_trust:,} 張"
+except Exception as e:
+    print(f"[{ticker}] 籌碼抓取失敗: {e}")
+    
+return "今日暫無籌碼數據或抓取失敗"
 
-# ==========================================
-# === 3. 台股個股決策運算 ===
-# ==========================================
-def generate_stock_advice(ticker, sox_change):
+
+==========================================
+
+📲 模組 2：Teams 推播通訊
+
+==========================================
+
+def send_teams_alert(ticker, current_price, status, advice, chip_summary):
+"""發送精美的 MessageCard 到 Teams 頻道"""
+payload = {
+"@type": "MessageCard",
+"@context": "http://schema.org/extensions",
+"themeColor": "E24A4A" if "跌破" in status else "28A745",
+"summary": f"🔔 {ticker} 策略觸發通知",
+"sections": [{
+"activityTitle": f"📈 量化系統警報：{ticker}",
+"activitySubtitle": f"⏱️ 9:20 開盤區間突破 (ORB) 策略觸發",
+"facts": [
+{"name": "即時狀態", "value": status},
+{"name": "觸發市價", "value": f"{current_price} 元"},
+{"name": "系統建議", "value": advice},
+{"name": "籌碼透視", "value": chip_summary}
+],
+"markdown": True
+}]
+}
+headers = {'Content-Type': 'application/json'}
+try:
+requests.post(WEBHOOK_URL, headers=headers, data=json.dumps(payload))
+print(f"✅ 成功發送 {ticker} 訊號至 Teams！")
+except Exception as e:
+print(f"❌ 發送 {ticker} Teams 訊號失敗: {e}")
+
+==========================================
+
+🧠 模組 3：讀取與寫入推播紀錄 (防洗版機制)
+
+==========================================
+
+def load_alert_history():
+if os.path.exists(LOG_FILE):
+try:
+with open(LOG_FILE, "r") as f:
+return json.load(f)
+except:
+return {}
+return {}
+
+def save_alert_history(history):
+with open(LOG_FILE, "w") as f:
+json.dump(history, f)
+
+==========================================
+
+🚀 主程式：每日早盤掃描引擎
+
+==========================================
+
+def main():
+print(f"🤖 啟動每日早盤掃描機器人 - 執行日期: {TODAY_STR}")
+
+# 讀取歷史推播紀錄
+alert_history = load_alert_history()
+if TODAY_STR not in alert_history:
+    alert_history[TODAY_STR] = [] # 初始化今日的清單
+    
+for ticker in TARGET_STOCKS:
+    print(f"🔍 正在分析 {ticker}...")
+    
+    # 檢查今天是否已經推播過了
+    if ticker in alert_history[TODAY_STR]:
+        print(f"⚠️ {ticker} 今日已發送過警報，跳過處理。")
+        continue
+        
     try:
-        df = yf.Ticker(ticker).history(period="3mo")
-        if df.empty: return f"**{format_ticker(ticker)}**：⚠️ 無法取得歷史資料"
+        # 抓取今日 5 分 K 線
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="1d", interval="5m")
         
-        last_c = df['Close'].iloc[-1]
-        ma20 = df['Close'].rolling(20).mean().iloc[-1]
-        
-        tr = pd.concat([
-            df['High'] - df['Low'],
-            (df['High'] - df['Close'].shift()).abs(),
-            (df['Low'] - df['Close'].shift()).abs()
-        ], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        
-        if sox_change >= 1.0 and last_c > ma20:
-            verdict = "🟢 今日建議買進"
-            in_low = round(last_c, 2)
-            in_high = round(last_c + (atr * 0.3), 2)
-            entry = f"{in_low} ~ {in_high} (小幅回踩試單)"
-            target = round(last_c + (atr * 1.5), 2)
-            stop = round(last_c - (atr * 0.8), 2)
-        elif sox_change <= -1.0 and last_c > ma20:
-            verdict = "🟡 盤中拉回低接"
-            in_low = round(last_c - (atr * 0.8), 2)
-            in_high = round(last_c - (atr * 0.3), 2)
-            entry = f"{in_low} ~ {in_high} (逢低掛單低接)"
-            target = round(last_c + (atr * 1.0), 2)
-            stop = round(ma20 * 0.98, 2)
-        elif last_c < ma20 and sox_change <= 0:
-            verdict = "⚪ 今日建議觀望"
-            entry = "暫無建議進場點"
-            target = "-"
-            stop = "-"
+        # 確保資料量足夠 (至少要過 9:20，也就是第 4 根 K 線)
+        if not df.empty and len(df) >= 4:
+            morning_range = df.iloc[:4]
+            orb_high = morning_range['High'].max()
+            orb_low = morning_range['Low'].min()
+            current_price = df['Close'].iloc[-1]
+            
+            status = ""
+            advice = ""
+            
+            # 判斷是否突破或跌破
+            if current_price > orb_high:
+                status = "🟢 強勢突破早盤高點"
+                advice = f"主力拉抬，市價已突破 9:20 高點 **{orb_high:.2f}** 元。建議拉回不破可偏多佈局。"
+            elif current_price < orb_low:
+                status = "🔴 弱勢跌破早盤低點"
+                advice = f"賣壓沉重，市價已跌穿 9:20 低點 **{orb_low:.2f}** 元。建議空手觀望或順勢偏空。"
+                
+            # 如果有產生訊號，則執行籌碼抓取與推播
+            if status != "":
+                chip_summary = fetch_institutional_chips(ticker)
+                send_teams_alert(ticker, current_price, status, advice, chip_summary)
+                
+                # 記錄起來，今天不再重複推播
+                alert_history[TODAY_STR].append(ticker)
+                save_alert_history(alert_history)
+            else:
+                print(f"[{ticker}] 目前在 9:20 區間內震盪 ({orb_low:.2f} ~ {orb_high:.2f})，無訊號。")
         else:
-            verdict = "🔴 逢高減碼獲利"
-            entry = "不建議買入"
-            target = round(last_c + (atr * 0.8), 2)
-            stop = round(ma20, 2)
+            print(f"[{ticker}] 數據不足，可能尚未開盤或抓取不到今日資料。")
             
-        return f"**{format_ticker(ticker)}**：{verdict}\n\n📍 進場：{entry} | 🎯 目標：{target} | 🛑 停損：{stop}"
     except Exception as e:
-        return f"**{format_ticker(ticker)}**：⚠️ 計算錯誤"
+        print(f"❌ 處理 {ticker} 時發生錯誤: {e}")
+        
+print("🏁 今日掃描任務結束。")
 
-# ==========================================
-# === 4. 組裝訊息並發送至 Teams ===
-# ==========================================
-def send_to_teams():
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    sox_change, tsm_change = get_us_market_context()
-    
-    # 組合 Markdown 訊息
-    message_text = f"### 🤖 晨間 AI 盤前決策報告 ({now_str})\n\n"
-    message_text += f"**🇺🇸 隔夜美股關鍵指標**\n\n"
-    message_text += f"- 費城半導體 (SOX)：`{sox_change:+.2f}%`\n\n"
-    message_text += f"- 台積電 ADR：`{tsm_change:+.2f}%`\n\n"
-    message_text += f"---\n\n**🎯 個股今日操作指引**\n\n"
-    
-    for ticker in TARGET_STOCKS:
-        advice = generate_stock_advice(ticker, sox_change)
-        if advice:
-            message_text += f"- {advice}\n\n"
-            
-    if "你的_teams_webhook_網址" in TEAMS_WEBHOOK_URL or not TEAMS_WEBHOOK_URL.startswith("http"):
-        print("\n⚠️ 【注意】您尚未填入正確的 Teams Webhook 網址！\n")
-        return
 
-    # 【關鍵修改】：換成微軟新版 Workflows 專用的 Adaptive Card (適應性卡片) 格式
-    payload = {
-        "type": "message",
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "contentUrl": None,
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.2",
-                    "body": [
-                        {
-                            "type": "TextBlock",
-                            "text": message_text,
-                            "wrap": True
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-    
-    headers = {'Content-Type': 'application/json'}
-    response = requests.post(TEAMS_WEBHOOK_URL, headers=headers, data=json.dumps(payload))
-    
-    # 【關鍵修改】：把 202 (Accepted) 也視為成功！
-    if response.status_code in [200, 202]:
-        print(f"✅ 成功發送至 Teams 頻道！(伺服器回應碼：{response.status_code})")
-    else:
-        print(f"❌ 發送失敗，錯誤碼：{response.status_code}")
-        print(f"錯誤訊息：{response.text}")
-
-if __name__ == "__main__":
-    send_to_teams()
+if name == "main":
+main()
